@@ -5,6 +5,8 @@ import (
 	"github.com/skelterjohn/go.wde"
 	_ "github.com/skelterjohn/go.wde/init"
 	"image"
+	"image/color"
+	"image/draw"
 	"image/png"
 	"log"
 	"os"
@@ -29,7 +31,8 @@ func setTile(x, y int, tile image.Image) {
 }
 
 func getTile(x, y int) (tile image.Image, ok bool) {
-	if xtiles, ok := tiles[x]; ok {
+	var xtiles map[int]image.Image
+	if xtiles, ok = tiles[x]; ok {
 		tile, ok = xtiles[y]
 	}
 	return
@@ -73,19 +76,23 @@ func loadImages(imageDir string) {
 
 			switch parts[2] {
 			case "n":
+				y -= 1
 			case "s":
 				y *= -1
-				y += 1
 			default:
 				log.Fatalf("Couldn't parse %q", name)
 			}
 			switch parts[4] {
 			case "e":
+				x -= 1
 			case "w":
 				x *= -1
-				x += 1
 			default:
 				log.Fatalf("Couldn't parse %q", name)
+			}
+
+			if x != 0 || y != 0 {
+				continue
 			}
 
 			imageFile, err := os.Open(file)
@@ -101,6 +108,9 @@ func loadImages(imageDir string) {
 			}
 
 			setTile(x, y, tile)
+			if _, ok := getTile(x, y); !ok {
+				panic("not ok!")
+			}
 		}
 	}
 }
@@ -111,7 +121,7 @@ var drawx, drawy float64
 
 // scale is how many drawx and drawy units there are per screen pixel
 // the higher scale is, the more zoomed out the view is
-var scale float64 = 1
+var scale float64 = 10
 
 const imageWidth, imageHeight = 2048, 2048
 
@@ -161,9 +171,44 @@ func window() {
 
 		for i := 0; ; i++ {
 			width, height := dw.Size()
-			_, _ = width, height
+
+			bounds := image.Rectangle{}
+			bounds.Min.X = int((drawx - float64(width)/2) * scale)
+			bounds.Min.Y = int((drawy - float64(height)/2) * scale)
+			bounds.Max.X = int((drawx + float64(width)/2) * scale)
+			bounds.Max.Y = int((drawy + float64(height)/2) * scale)
+
+			tileMinX := bounds.Min.X/imageWidth - 1
+			tileMinY := bounds.Min.Y/imageHeight - 1
+			tileMaxX := bounds.Max.X/imageWidth + 1
+			tileMaxY := bounds.Max.Y/imageHeight + 1
+
 			s := dw.Screen()
-			_ = s
+
+			for tilex := tileMinX; tilex <= tileMaxX; tilex++ {
+				for tiley := tileMinY; tiley <= tileMaxY; tiley++ {
+					tile, ok := getTile(tilex, tiley)
+					if !ok {
+						continue
+					}
+
+					tiledx := float64(tilex) * imageWidth / scale
+					tiledy := float64(tiley) * imageHeight / scale
+					drawRect := image.Rectangle{
+						Min: image.Point{
+							X: int(tiledx),
+							Y: int(tiledy),
+						},
+						Max: image.Point{
+							X: int(tiledx + imageWidth/scale),
+							Y: int(tiledy + imageHeight/scale),
+						},
+					}
+
+					draw.Draw(s, drawRect, tile, image.Point{0, 0}, draw.Over)
+					s.Set(100, 100, color.RGBA{255, 0, 0, 255})
+				}
+			}
 
 			dw.FlushImage()
 			select {
