@@ -1,9 +1,12 @@
 package main
 
 import (
+	"code.google.com/p/appengine-go/example/moustachio/resize"
 	"fmt"
 	"github.com/skelterjohn/go.wde"
 	_ "github.com/skelterjohn/go.wde/init"
+
+	"github.com/BurntSushi/xgbutil/xgraphics"
 	"image"
 	"image/color"
 	"image/draw"
@@ -15,19 +18,23 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
-	"time"
 )
 
 var tiles = map[int]map[int]image.Image{}
 
 func setTile(x, y int, tile image.Image) {
+
+	// rgbaTile := image.NewRGBA(tile.Bounds())
+	// fmt.Printf("%T\n", rgbaTile)
+	// draw.Draw(rgbaTile, tile.Bounds(), tile, image.Point{0, 0}, draw.Src)
+	// tile = rgbaTile
+
 	xtiles := tiles[x]
 	if xtiles == nil {
 		xtiles = map[int]image.Image{}
 		tiles[x] = xtiles
 	}
 	xtiles[y] = tile
-	log.Printf("(%d, %d) is %v", x, y, tile.Bounds())
 }
 
 func getTile(x, y int) (tile image.Image, ok bool) {
@@ -38,7 +45,41 @@ func getTile(x, y int) (tile image.Image, ok bool) {
 	return
 }
 
-var coordRegexp = regexp.MustCompile(`(\d+)(.)(\d+)(.)`)
+var scaledTiles = map[float64]map[int]map[int]chan image.Image{}
+
+func getScaledTile(x, y int, scale float64) (scaledTile image.Image, ok bool) {
+	unscaled, ok := getTile(x, y)
+	if !ok {
+		return
+	}
+	stiles, ok := scaledTiles[scale]
+	if !ok {
+		stiles = map[int]map[int]chan image.Image{}
+		scaledTiles[scale] = stiles
+	}
+	sxtiles, ok := stiles[x]
+	if !ok {
+		sxtiles = map[int]chan image.Image{}
+		stiles[x] = sxtiles
+	}
+	scaledTileChan, ok := sxtiles[y]
+	if !ok {
+		bounds := unscaled.Bounds()
+		s := bounds.Size()
+		scaledTileChan = make(chan image.Image, 1)
+		go func() {
+			scaledTileChan <- resize.Resize(unscaled, unscaled.Bounds(), int(float64(s.X)/scale), int(float64(s.Y)/scale))
+		}()
+		sxtiles[y] = scaledTileChan
+	}
+	select {
+	case scaledTile = <-scaledTileChan:
+		scaledTileChan <- scaledTile
+	default:
+		ok = false
+	}
+	return
+}
 
 func loadImages(imageDir string) {
 
@@ -53,6 +94,8 @@ func loadImages(imageDir string) {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	coordRegexp := regexp.MustCompile(`(\d+)(.)(\d+)(.)`)
 
 	for _, file := range files {
 		file = filepath.Join(imageDir, file)
@@ -91,8 +134,8 @@ func loadImages(imageDir string) {
 				log.Fatalf("Couldn't parse %q", name)
 			}
 
-			if x != 0 || y != 0 {
-				continue
+			if x < -1 || x > 1 || y < -1 || y > 1 {
+				//continue
 			}
 
 			imageFile, err := os.Open(file)
@@ -113,6 +156,26 @@ func loadImages(imageDir string) {
 			}
 		}
 	}
+}
+
+func mapToWorld(dx, dy int) (wx, wy float64) {
+	wx = float64(dx)
+	wy = float64(dy)
+	wx *= scale
+	wy *= scale
+	wx -= drawx
+	wy -= drawy
+	return
+}
+
+func mapToScreen(wx, wy float64) (dx, dy int) {
+	wx += drawx
+	wy += drawy
+	wx /= scale
+	wy /= scale
+	dx = int(wx)
+	dy = int(wy)
+	return
 }
 
 // (drawx, drawy) is the world point drawn in the center of the window
@@ -144,75 +207,109 @@ func window() {
 
 		events := dw.EventChan()
 
+		redraw := make(chan bool, 1)
+
 		done := make(chan bool)
 
 		go func() {
+			redraw <- true
 		loop:
 			for ei := range events {
+				invalid := false
 				runtime.Gosched()
 				switch e := ei.(type) {
+				case wde.MouseDownEvent:
 				case wde.MouseDraggedEvent:
+					changedx := e.Where.X - e.From.X
+					changedy := e.Where.Y - e.From.Y
+					drawx += float64(changedx) * scale
+					drawy += float64(-changedy) * scale
+					invalid = true
 				case wde.KeyTypedEvent:
-					fmt.Println("typed", e.Key, e.Glyph, e.Chord)
 					if e.Key == wde.KeyEscape {
 						break loop
 					}
 				case wde.CloseEvent:
-					fmt.Println("close")
 					break loop
 				case wde.ResizeEvent:
-					fmt.Println("resize", e.Width, e.Height)
+					invalid = true
+				}
+				if invalid {
+					select {
+					case redraw <- true:
+					default:
+					}
 				}
 			}
 			dw.Close()
 			done <- true
-			fmt.Println("end of events")
 		}()
 
-		for i := 0; ; i++ {
-			width, height := dw.Size()
+		var greyBack, screenBuffer *image.RGBA
+		var grey = color.RGBA{155, 155, 155, 255}
 
-			bounds := image.Rectangle{}
-			bounds.Min.X = int((drawx - float64(width)/2) * scale)
-			bounds.Min.Y = int((drawy - float64(height)/2) * scale)
-			bounds.Max.X = int((drawx + float64(width)/2) * scale)
-			bounds.Max.Y = int((drawy + float64(height)/2) * scale)
-
-			tileMinX := bounds.Min.X/imageWidth - 1
-			tileMinY := bounds.Min.Y/imageHeight - 1
-			tileMaxX := bounds.Max.X/imageWidth + 1
-			tileMaxY := bounds.Max.Y/imageHeight + 1
-
-			s := dw.Screen()
-
-			for tilex := tileMinX; tilex <= tileMaxX; tilex++ {
-				for tiley := tileMinY; tiley <= tileMaxY; tiley++ {
-					tile, ok := getTile(tilex, tiley)
-					if !ok {
-						continue
-					}
-
-					tiledx := float64(tilex) * imageWidth / scale
-					tiledy := float64(tiley) * imageHeight / scale
-					drawRect := image.Rectangle{
-						Min: image.Point{
-							X: int(tiledx),
-							Y: int(tiledy),
-						},
-						Max: image.Point{
-							X: int(tiledx + imageWidth/scale),
-							Y: int(tiledy + imageHeight/scale),
-						},
-					}
-
-					draw.Draw(s, drawRect, tile, image.Point{0, 0}, draw.Over)
-					s.Set(100, 100, color.RGBA{255, 0, 0, 255})
-				}
-			}
-
-			dw.FlushImage()
+		for {
 			select {
-			case <-time.After(time.Second):
+			case <-redraw:
+				width, height := dw.Size()
+
+				tilesh := int(float64(width)/(float64(imageWidth)/scale) + 1)
+				tilesv := int(float64(height)/(float64(imageHeight)/scale) + 1)
+
+				tilecx := drawx / imageWidth
+				tilecy := drawy / imageHeight
+
+				tileMinX := int(-tilecx) - tilesh
+				tileMinY := int(-tilecy) - tilesv
+				tileMaxX := int(-tilecx) + tilesh
+				tileMaxY := int(-tilecy) + tilesv
+
+				s := dw.Screen()
+
+				if greyBack == nil || s.Bounds() != greyBack.Bounds() {
+					bounds := s.Bounds()
+					greyBack = image.NewRGBA(bounds)
+					for x := bounds.Min.X; x <= bounds.Max.X; x++ {
+						for y := bounds.Min.Y; y <= bounds.Max.Y; y++ {
+							greyBack.SetRGBA(x, y, grey)
+						}
+					}
+					screenBuffer = image.NewRGBA(bounds)
+				}
+
+				draw.Draw(screenBuffer, screenBuffer.Bounds(), greyBack, image.Point{0, 0}, draw.Src)
+
+				for tilex := tileMinX; tilex <= tileMaxX; tilex++ {
+					for tiley := tileMinY; tiley <= tileMaxY; tiley++ {
+						scaledTile, ok := getScaledTile(tilex, tiley, scale)
+						if !ok {
+							continue
+						}
+
+						dx, dy := mapToScreen(float64(tilex)*imageWidth, float64(tiley)*imageHeight)
+
+						drawRect := scaledTile.Bounds()
+						drawRect.Min.X += dx
+						drawRect.Min.Y -= dy
+						drawRect.Max.X += dx
+						drawRect.Max.Y -= dy
+
+						draw.Draw(screenBuffer, drawRect, scaledTile, image.Point{0, 0}, draw.Src)
+					}
+				}
+
+				if xs, ok := s.(*xgraphics.Image); ok {
+					xdata := xs.Pix
+					copy(xdata, screenBuffer.Pix)
+					// xgraphics.Image is BGRA, not RGBA, so swap some bits
+					for i := 0; i < len(xdata)/4; i++ {
+						index := i * 4
+						xdata[index], xdata[index+2] = xdata[index+2], xdata[index]
+					}
+				} else {
+					draw.Draw(s, s.Bounds(), screenBuffer, image.Point{0, 0}, draw.Src)
+				}
+				dw.FlushImage()
 			case <-done:
 				wg.Done()
 				return
