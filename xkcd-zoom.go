@@ -166,9 +166,9 @@ func loadImages(imageDir string) {
 	}
 }
 
-func mapToWorld(dx, dy int) (wx, wy float64) {
-	wx = float64(dx)
-	wy = float64(dy)
+func mapToWorld(width, height, dx, dy int) (wx, wy float64) {
+	wx = float64(dx - width/2)
+	wy = float64(dy + height/2)
 	wx *= scale
 	wy *= scale
 	wx -= drawx
@@ -176,13 +176,13 @@ func mapToWorld(dx, dy int) (wx, wy float64) {
 	return
 }
 
-func mapToScreen(wx, wy float64) (dx, dy int) {
+func mapToScreen(width, height int, wx, wy float64) (dx, dy int) {
 	wx += drawx
 	wy += drawy
 	wx /= scale
 	wy /= scale
-	dx = int(wx)
-	dy = int(wy)
+	dx = int(wx) + width/2
+	dy = int(wy) - height/2
 	return
 }
 
@@ -328,7 +328,7 @@ func window() {
 								continue
 							}
 
-							dx, dy := mapToScreen(float64(tilex)*imageWidth, float64(tiley)*imageHeight)
+							dx, dy := mapToScreen(width, height, float64(tilex)*imageWidth, float64(tiley)*imageHeight)
 
 							drawRect := scaledTile.Bounds()
 							drawRect.Min.X += dx
