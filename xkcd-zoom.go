@@ -166,29 +166,20 @@ func loadImages(imageDir string) {
 	}
 }
 
-func mapToWorld(width, height, dx, dy int) (wx, wy float64) {
-	wx = float64(dx - width/2)
-	wy = float64(dy + height/2)
-	wx *= scale
-	wy *= scale
-	wx -= drawx
-	wy -= drawy
-	return
-}
-
 func mapToScreen(width, height int, wx, wy float64) (dx, dy int) {
 	wx += drawx
 	wy += drawy
 	wx /= scale
 	wy /= scale
-	dx = int(wx) + width/2
-	dy = int(wy) - height/2
+	dx = int(wx) // + width/2
+	dy = int(wy) // - height/2
 	return
 }
 
 // (drawx, drawy) is the world point drawn in the center of the window
 // 1 drawx or drawy unit represents 1 pixel in the supplied image
-var drawx, drawy float64
+var drawx float64 = 120
+var drawy float64 = 1000
 
 // scale is how many drawx and drawy units there are per screen pixel
 // the higher scale is, the more zoomed out the view is
@@ -197,9 +188,40 @@ var scale float64 = 1
 const imageWidth, imageHeight = 2048, 2048
 
 func copyToXGraphicsImage(xs *xgraphics.Image, buffer *image.RGBA) {
-
+	//Pix[(y-Rect.Min.Y)*Stride + (x-Rect.Min.X)*4]
 	xdata := xs.Pix
-	copy(xdata, buffer.Pix)
+	bdata := buffer.Pix
+	if xs.Bounds() == buffer.Bounds() {
+		copy(xdata, bdata)
+	} else {
+
+		xb := xs.Bounds()
+		bb := buffer.Bounds()
+
+		miny := xb.Min.Y
+		if miny < bb.Min.Y {
+			miny = bb.Min.Y
+		}
+		maxy := xb.Max.Y
+		if maxy > bb.Max.Y {
+			maxy = bb.Max.Y
+		}
+
+		xRowLen := (xb.Max.X - xb.Min.X)
+		bRowLen := (bb.Max.X - bb.Min.X)
+		rowLen := xRowLen
+		if bRowLen < rowLen {
+			rowLen = bRowLen
+		}
+
+		for y := miny; y < maxy; y++ {
+			xstart := (y-xb.Min.Y)*xs.Stride - xb.Min.X*4
+			bstart := (y-bb.Min.Y)*buffer.Stride - bb.Min.X*4
+			xrow := xdata[xstart : xstart+rowLen*4]
+			brow := bdata[bstart : bstart+rowLen*4]
+			copy(xrow, brow)
+		}
+	}
 	// xgraphics.Image is BGRA, not RGBA, so swap some bits
 	for i := 0; i < len(xdata)/4; i++ {
 		index := i * 4
@@ -227,11 +249,14 @@ func window() {
 		events := dw.EventChan()
 
 		const (
-			Redraw       = 1
-			ScaleInPlace = 2
+			Draw         = 1
+			Redraw       = 2
+			ScaleInPlace = 3
 		)
 
 		redraw := make(chan int, 1)
+
+		redraw <- Draw
 
 		done := make(chan bool)
 
@@ -256,16 +281,17 @@ func window() {
 						changedy := e.Where.Y - e.From.Y
 						drawx += float64(changedx) * scale
 						drawy += float64(-changedy) * scale
-						redrawType = Redraw
+						redrawType = Draw
 					case wde.RightButton:
-						changedy := e.Where.Y - e.From.Y
+						changedy := e.From.Y - e.Where.Y
 						mouseScale := float64(changedy) / 100
 						scale *= math.Pow(2, mouseScale)
+						redrawType = ScaleInPlace
 					}
 				case wde.MouseUpEvent:
 					if e.Which == wde.RightButton {
 						scaledTiles = map[float64]map[int]map[int]chan image.Image{}
-						redrawType = Redraw
+						redrawType = Draw
 					}
 				case wde.KeyTypedEvent:
 					if e.Key == wde.KeyEscape {
@@ -274,7 +300,7 @@ func window() {
 				case wde.CloseEvent:
 					break loop
 				case wde.ResizeEvent:
-					redrawType = Redraw
+					redrawType = Draw
 				}
 				if redrawType != 0 {
 					select {
@@ -289,12 +315,17 @@ func window() {
 
 		var greyBack, screenBuffer *image.RGBA
 		var grey = color.RGBA{155, 155, 155, 255}
-
+		var bufferScale = scale
+		var lastRedraw int
 		for {
 			select {
 			case redrawType := <-redraw:
+				if lastRedraw == ScaleInPlace && redrawType == Redraw {
+					continue
+				}
+				lastRedraw = redrawType
 				s := dw.Screen()
-				if redrawType == Redraw {
+				if redrawType == Draw || redrawType == Redraw {
 					width, height := dw.Size()
 
 					tilesh := int(float64(width)/(float64(imageWidth)/scale) + 1)
@@ -303,10 +334,10 @@ func window() {
 					tilecx := drawx / imageWidth
 					tilecy := drawy / imageHeight
 
-					tileMinX := int(-tilecx) - tilesh
-					tileMinY := int(-tilecy) - tilesv
-					tileMaxX := int(-tilecx) + tilesh
-					tileMaxY := int(-tilecy) + tilesv
+					tileMinX := int(-tilecx) - tilesh - 1
+					tileMinY := int(-tilecy) - tilesv - 1
+					tileMaxX := int(-tilecx) + tilesh + 1
+					tileMaxY := int(-tilecy) + tilesv + 1
 
 					if greyBack == nil || s.Bounds() != greyBack.Bounds() {
 						bounds := s.Bounds()
@@ -340,13 +371,45 @@ func window() {
 						}
 					}
 
+					bufferScale = scale
 					if xs, ok := s.(*xgraphics.Image); ok {
 						copyToXGraphicsImage(xs, screenBuffer)
 					} else {
 						draw.Draw(s, s.Bounds(), screenBuffer, image.Point{0, 0}, draw.Src)
 					}
 				} else if redrawType == ScaleInPlace {
+					scaleFactor := scale / bufferScale
+					bufBounds := screenBuffer.Bounds()
+					width := bufBounds.Max.X - bufBounds.Min.X
+					height := bufBounds.Max.Y - bufBounds.Min.Y
+					if scaleFactor < 1 {
+						widthDiff := width - int(float64(width)*scaleFactor)
+						heightDiff := height - int(float64(height)*scaleFactor)
+						//bufBounds.Min.X += widthDiff / 2
+						bufBounds.Max.X -= widthDiff
+						//bufBounds.Min.Y += heightDiff / 2
+						bufBounds.Max.Y -= heightDiff
+						subBuffer := screenBuffer.SubImage(bufBounds)
+						scaledBuffer := resize.Resize(subBuffer, subBuffer.Bounds(), width, height).(*image.RGBA)
 
+						if xs, ok := s.(*xgraphics.Image); ok {
+							copyToXGraphicsImage(xs, scaledBuffer)
+						} else {
+							draw.Draw(s, s.Bounds(), scaledBuffer, image.Point{0, 0}, draw.Src)
+						}
+					}
+					if scaleFactor > 1 {
+						scaleFactor = 1 / scaleFactor
+						newWidth := int(float64(width) * scaleFactor)
+						newHeight := int(float64(height) * scaleFactor)
+						scaledBuffer := resize.Resize(screenBuffer, screenBuffer.Bounds(), newWidth, newHeight).(*image.RGBA)
+
+						if xs, ok := s.(*xgraphics.Image); ok {
+							copyToXGraphicsImage(xs, scaledBuffer)
+						} else {
+							draw.Draw(s, s.Bounds(), scaledBuffer, image.Point{0, 0}, draw.Src)
+						}
+					}
 				}
 				dw.FlushImage()
 			case <-done:
@@ -361,6 +424,8 @@ func window() {
 }
 
 func main() {
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
 	if len(os.Args) != 2 {
 		log.Fatalf("Usage: %s <image directory>", os.Args[0])
 	}
