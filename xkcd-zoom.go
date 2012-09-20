@@ -22,27 +22,48 @@ import (
 	"time"
 )
 
-var tiles = map[int]map[int]image.Image{}
+var tiles = map[image.Point]chan image.Image{}
 
-func setTile(x, y int, tile image.Image) {
+var tileFiles = map[image.Point]string{}
 
-	// rgbaTile := image.NewRGBA(tile.Bounds())
-	// fmt.Printf("%T\n", rgbaTile)
-	// draw.Draw(rgbaTile, tile.Bounds(), tile, image.Point{0, 0}, draw.Src)
-	// tile = rgbaTile
+func setTileFile(x, y int, file string) {
+	tileFiles[image.Point{x, y}] = file
+}
 
-	xtiles := tiles[x]
-	if xtiles == nil {
-		xtiles = map[int]image.Image{}
-		tiles[x] = xtiles
-	}
-	xtiles[y] = tile
+func makeTileChan(file string) (tilechan chan image.Image) {
+	tilechan = make(chan image.Image, 1)
+	go func() {
+		log.Printf("Loading %q\n", file)
+		fi, err := os.Open(file)
+		if err != nil {
+			log.Fatal(err)
+		}
+		tile, err := png.Decode(fi)
+		if err != nil {
+			log.Fatal(err)
+		}
+		tilechan <- tile
+	}()
+	return
 }
 
 func getTile(x, y int) (tile image.Image, ok bool) {
-	var xtiles map[int]image.Image
-	if xtiles, ok = tiles[x]; ok {
-		tile, ok = xtiles[y]
+	tilechan, ok := tiles[image.Point{x, y}]
+	if !ok {
+		var file string
+		file, ok = tileFiles[image.Point{x, y}]
+		if !ok {
+			return
+		}
+		tilechan = makeTileChan(file)
+		tiles[image.Point{x, y}] = tilechan
+	}
+	select {
+	case tile = <-tilechan:
+		tilechan <- tile
+		ok = true
+	default:
+		ok = false
 	}
 	return
 }
@@ -70,7 +91,7 @@ func getScaledTile(x, y int, scale float64) (scaledTile image.Image, ok bool) {
 		s := bounds.Size()
 		scaledTileChan = make(chan image.Image, 1)
 		go func() {
-			scaledTileChan <- resize.Resize(unscaled, unscaled.Bounds(), int(float64(s.X)/scale), int(float64(s.Y)/scale))
+			scaledTileChan <- resize.Resize(unscaled, unscaled.Bounds(), int(.5+float64(s.X)/scale), int(.5+float64(s.Y)/scale))
 		}()
 		sxtiles[y] = scaledTileChan
 	}
@@ -140,22 +161,7 @@ func loadImages(imageDir string) {
 				//continue
 			}
 
-			imageFile, err := os.Open(file)
-			if err != nil {
-				log.Fatalf(err.Error())
-			}
-
-			log.Printf("Loading %q\n", file)
-
-			tile, err := png.Decode(imageFile)
-			if err != nil {
-				log.Fatalf(fmt.Sprintf("trying to decode %q: %v", err))
-			}
-
-			setTile(x, y, tile)
-			if _, ok := getTile(x, y); !ok {
-				panic("not ok!")
-			}
+			setTileFile(x, y, file)
 		}
 	}
 }
