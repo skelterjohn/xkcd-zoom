@@ -12,12 +12,14 @@ import (
 	"image/draw"
 	"image/png"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
 	"sync"
+	"time"
 )
 
 var tiles = map[int]map[int]image.Image{}
@@ -184,9 +186,20 @@ var drawx, drawy float64
 
 // scale is how many drawx and drawy units there are per screen pixel
 // the higher scale is, the more zoomed out the view is
-var scale float64 = 10
+var scale float64 = 1
 
 const imageWidth, imageHeight = 2048, 2048
+
+func copyToXGraphicsImage(xs *xgraphics.Image, buffer *image.RGBA) {
+
+	xdata := xs.Pix
+	copy(xdata, buffer.Pix)
+	// xgraphics.Image is BGRA, not RGBA, so swap some bits
+	for i := 0; i < len(xdata)/4; i++ {
+		index := i * 4
+		xdata[index], xdata[index+2] = xdata[index+2], xdata[index]
+	}
+}
 
 func window() {
 	var wg sync.WaitGroup
@@ -207,24 +220,47 @@ func window() {
 
 		events := dw.EventChan()
 
-		redraw := make(chan bool, 1)
+		const (
+			Redraw       = 1
+			ScaleInPlace = 2
+		)
+
+		redraw := make(chan int, 1)
 
 		done := make(chan bool)
 
 		go func() {
-			redraw <- true
+			for {
+				time.Sleep(time.Second)
+				redraw <- Redraw
+			}
+		}()
+
+		go func() {
 		loop:
 			for ei := range events {
-				invalid := false
+				redrawType := 0
 				runtime.Gosched()
 				switch e := ei.(type) {
 				case wde.MouseDownEvent:
 				case wde.MouseDraggedEvent:
-					changedx := e.Where.X - e.From.X
-					changedy := e.Where.Y - e.From.Y
-					drawx += float64(changedx) * scale
-					drawy += float64(-changedy) * scale
-					invalid = true
+					switch e.Which {
+					case wde.LeftButton:
+						changedx := e.Where.X - e.From.X
+						changedy := e.Where.Y - e.From.Y
+						drawx += float64(changedx) * scale
+						drawy += float64(-changedy) * scale
+						redrawType = Redraw
+					case wde.RightButton:
+						changedy := e.Where.Y - e.From.Y
+						mouseScale := float64(changedy) / 100
+						scale *= math.Pow(2, mouseScale)
+					}
+				case wde.MouseUpEvent:
+					if e.Which == wde.RightButton {
+						scaledTiles = map[float64]map[int]map[int]chan image.Image{}
+						redrawType = Redraw
+					}
 				case wde.KeyTypedEvent:
 					if e.Key == wde.KeyEscape {
 						break loop
@@ -232,11 +268,11 @@ func window() {
 				case wde.CloseEvent:
 					break loop
 				case wde.ResizeEvent:
-					invalid = true
+					redrawType = Redraw
 				}
-				if invalid {
+				if redrawType != 0 {
 					select {
-					case redraw <- true:
+					case redraw <- redrawType:
 					default:
 					}
 				}
@@ -250,64 +286,61 @@ func window() {
 
 		for {
 			select {
-			case <-redraw:
-				width, height := dw.Size()
-
-				tilesh := int(float64(width)/(float64(imageWidth)/scale) + 1)
-				tilesv := int(float64(height)/(float64(imageHeight)/scale) + 1)
-
-				tilecx := drawx / imageWidth
-				tilecy := drawy / imageHeight
-
-				tileMinX := int(-tilecx) - tilesh
-				tileMinY := int(-tilecy) - tilesv
-				tileMaxX := int(-tilecx) + tilesh
-				tileMaxY := int(-tilecy) + tilesv
-
+			case redrawType := <-redraw:
 				s := dw.Screen()
+				if redrawType == Redraw {
+					width, height := dw.Size()
 
-				if greyBack == nil || s.Bounds() != greyBack.Bounds() {
-					bounds := s.Bounds()
-					greyBack = image.NewRGBA(bounds)
-					for x := bounds.Min.X; x <= bounds.Max.X; x++ {
-						for y := bounds.Min.Y; y <= bounds.Max.Y; y++ {
-							greyBack.SetRGBA(x, y, grey)
+					tilesh := int(float64(width)/(float64(imageWidth)/scale) + 1)
+					tilesv := int(float64(height)/(float64(imageHeight)/scale) + 1)
+
+					tilecx := drawx / imageWidth
+					tilecy := drawy / imageHeight
+
+					tileMinX := int(-tilecx) - tilesh
+					tileMinY := int(-tilecy) - tilesv
+					tileMaxX := int(-tilecx) + tilesh
+					tileMaxY := int(-tilecy) + tilesv
+
+					if greyBack == nil || s.Bounds() != greyBack.Bounds() {
+						bounds := s.Bounds()
+						greyBack = image.NewRGBA(bounds)
+						for x := bounds.Min.X; x <= bounds.Max.X; x++ {
+							for y := bounds.Min.Y; y <= bounds.Max.Y; y++ {
+								greyBack.SetRGBA(x, y, grey)
+							}
+						}
+						screenBuffer = image.NewRGBA(bounds)
+					}
+
+					draw.Draw(screenBuffer, screenBuffer.Bounds(), greyBack, image.Point{0, 0}, draw.Src)
+
+					for tilex := tileMinX; tilex <= tileMaxX; tilex++ {
+						for tiley := tileMinY; tiley <= tileMaxY; tiley++ {
+							scaledTile, ok := getScaledTile(tilex, tiley, scale)
+							if !ok || scaledTile == nil {
+								continue
+							}
+
+							dx, dy := mapToScreen(float64(tilex)*imageWidth, float64(tiley)*imageHeight)
+
+							drawRect := scaledTile.Bounds()
+							drawRect.Min.X += dx
+							drawRect.Min.Y -= dy
+							drawRect.Max.X += dx
+							drawRect.Max.Y -= dy
+
+							draw.Draw(screenBuffer, drawRect, scaledTile, image.Point{0, 0}, draw.Src)
 						}
 					}
-					screenBuffer = image.NewRGBA(bounds)
-				}
 
-				draw.Draw(screenBuffer, screenBuffer.Bounds(), greyBack, image.Point{0, 0}, draw.Src)
-
-				for tilex := tileMinX; tilex <= tileMaxX; tilex++ {
-					for tiley := tileMinY; tiley <= tileMaxY; tiley++ {
-						scaledTile, ok := getScaledTile(tilex, tiley, scale)
-						if !ok {
-							continue
-						}
-
-						dx, dy := mapToScreen(float64(tilex)*imageWidth, float64(tiley)*imageHeight)
-
-						drawRect := scaledTile.Bounds()
-						drawRect.Min.X += dx
-						drawRect.Min.Y -= dy
-						drawRect.Max.X += dx
-						drawRect.Max.Y -= dy
-
-						draw.Draw(screenBuffer, drawRect, scaledTile, image.Point{0, 0}, draw.Src)
+					if xs, ok := s.(*xgraphics.Image); ok {
+						copyToXGraphicsImage(xs, screenBuffer)
+					} else {
+						draw.Draw(s, s.Bounds(), screenBuffer, image.Point{0, 0}, draw.Src)
 					}
-				}
+				} else if redrawType == ScaleInPlace {
 
-				if xs, ok := s.(*xgraphics.Image); ok {
-					xdata := xs.Pix
-					copy(xdata, screenBuffer.Pix)
-					// xgraphics.Image is BGRA, not RGBA, so swap some bits
-					for i := 0; i < len(xdata)/4; i++ {
-						index := i * 4
-						xdata[index], xdata[index+2] = xdata[index+2], xdata[index]
-					}
-				} else {
-					draw.Draw(s, s.Bounds(), screenBuffer, image.Point{0, 0}, draw.Src)
 				}
 				dw.FlushImage()
 			case <-done:
